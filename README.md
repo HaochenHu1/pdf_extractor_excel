@@ -1,4 +1,4 @@
-#PDF Table Extractor to Excel
+PDF Table Extractor to Excel
 
 This package contains a local Python tool that takes a PDF as input and writes only the detected tables into an Excel workbook.
 
@@ -14,9 +14,9 @@ This package contains a local Python tool that takes a PDF as input and writes o
 
 Existing free tools already cover most of the hard work:
 
-- `Camelot` is strong for text based PDFs with clear table structure
-- `pdfplumber` is a good fallback when Camelot misses tables
-- `img2table` is useful for scanned PDFs and OCR based workflows
+- `Camelot` is for text based PDFs with clear table structure
+- `pdfplumber` is for when Camelot misses tables
+- `img2table` is for scanned PDFs and OCR based workflows
 
 So this script does not reimplement table recognition from scratch. It wraps the best free options into one command line tool.
 
@@ -24,6 +24,7 @@ So this script does not reimplement table recognition from scratch. It wraps the
 
 - `pdf_table_extractor.py` : main script
 - `requirements.txt` : Python dependencies
+  
 #======
 #Step 1
 #======
@@ -51,9 +52,7 @@ winget install --id UB-Mannheim.TesseractOCR
 #======
 #Step 2
 #======
-
 ##Usage
-
 ###Basic
 
 ```
@@ -66,7 +65,7 @@ This writes:
 input_tables.xlsx
 ```
 
-###Choose output path
+###Choose your output path
 
 ```
 python pdf_table_extractor.py input.pdf -o output.xlsx
@@ -86,7 +85,7 @@ python pdf_table_extractor.py input.pdf --mode pdfplumber
 python pdf_table_extractor.py input.pdf --mode img2table
 ```
 
-###Verbose logging
+###Logging for any issues
 
 ```
 python pdf_table_extractor.py input.pdf --verbose
