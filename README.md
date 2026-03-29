@@ -28,6 +28,7 @@ So this script does not reimplement table recognition from scratch. It wraps the
 #======
 #Step 1
 #======
+
 ##Install
 
 ###Base install
@@ -52,7 +53,9 @@ winget install --id UB-Mannheim.TesseractOCR
 #======
 #Step 2
 #======
+
 ##Usage
+
 ###Basic
 
 ```
