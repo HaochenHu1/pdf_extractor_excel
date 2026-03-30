@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
-import fitz  # PyMuPDF
-
+import fitz  #PyMuPDF
 
 @dataclass
 class ExtractedTable:
@@ -19,7 +18,17 @@ class ExtractedTable:
     score: float
     title: Optional[str] = None
 
-
+#Command line parameters
+#`input_pdf` for pdf path
+#`-o/--output` for export path
+#`--pages` for pages needed to be processed
+#`--mode` for selection of models
+#`-prefer` only affects Camelot
+#`--min-rows`/`--min-cols`/`--min-filled-ratio` for threshold for filtering fake tables
+#`--accuracy-threshold` lowest accuracy rate control
+#`--ocr-lang` language selection for pdf
+#`--borderless` asking script to detect tables without border
+#`--verbose` for logging print
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract tables from a PDF and write them to an Excel workbook."
@@ -90,12 +99,13 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
+#Only print log when verbose is true
 def log(message: str, verbose: bool = True) -> None:
     if verbose:
         print(message)
 
-
+#Convert a page number expression provided by the user 
+#into an actual list of page numbers
 def expand_page_ranges(pages_spec: str, max_pages: int) -> List[int]:
     if pages_spec.lower() == "all":
         return list(range(1, max_pages + 1))
@@ -119,7 +129,11 @@ def expand_page_ranges(pages_spec: str, max_pages: int) -> List[int]:
 
     return sorted(pages)
 
-
+#Cleaning/ Standardizing cell contents
+#Converts `None` into an empty string, casts any value to a string, 
+#Replaces carriage returns and line breaks with spaces, 
+#Uses regex to condense multiple consecutive whitespace characters into a single space, 
+#And finally removes leading and trailing whitespace
 def normalize_cell(value: object) -> str:
     if value is None:
         return ""
@@ -128,12 +142,15 @@ def normalize_cell(value: object) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
+#Creates a copy of the original table using `copy()`; 
+#Then cleanses every individual cell using `cleaned.map(normalize_cell)`
+#Removes any rows and columns that are entirely empty using apply(..., axis=1)`,
+#Finally, it resets the index to start from 0 and standardizes the column names to `col_1`
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.copy()
     cleaned = cleaned.map(normalize_cell)
 
-    # Drop fully empty rows and columns.
+    #Drop fully empty rows and columns.
     non_empty_row_mask = cleaned.apply(
         lambda row: any(normalize_cell(v) != "" for v in row), axis=1
     )
@@ -151,7 +168,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned.columns = [f"col_{i+1}" for i in range(cleaned.shape[1])]
     return cleaned
 
-
+#Using a score to determine whether a table is too sparse
 def dataframe_filled_ratio(df: pd.DataFrame) -> float:
     if df.empty:
         return 0.0
@@ -161,13 +178,12 @@ def dataframe_filled_ratio(df: pd.DataFrame) -> float:
     filled = int((df != "").sum().sum())
     return filled / total
 
-
+#Filter to determine if a table is worth keeping
 def looks_like_table(
     df: pd.DataFrame,
     min_rows: int,
     min_cols: int,
-    min_filled_ratio: float,
-) -> bool:
+    min_filled_ratio: float,) -> bool:
     if df.empty:
         return False
     if df.shape[0] < min_rows or df.shape[1] < min_cols:
@@ -176,7 +192,8 @@ def looks_like_table(
         return False
     return True
 
-
+#Determining if two tables are the same
+#because `auto` mode would make a table repeatedly processed by different modes
 def dataframe_signature(df: pd.DataFrame) -> Tuple[int, int, Tuple[Tuple[str, ...], ...]]:
     rows: List[Tuple[str, ...]] = []
     for row in df.itertuples(index=False, name=None):
@@ -195,7 +212,7 @@ def deduplicate_tables(tables: Sequence[ExtractedTable]) -> List[ExtractedTable]
     deduped.sort(key=lambda t: (t.page, t.engine, -t.score))
     return deduped
 
-
+#Determining if a pdf is scanned or text-based
 def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
     doc = fitz.open(input_pdf)
     total_chars = 0
@@ -208,7 +225,24 @@ def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
         return "text"
     return "scanned"
 
-
+#`extract_with_camelot(...)` is the first function that actually performs table extraction
+#Its purpose is to handle text based PDFs
+#It first tries to import camelot. If camelot is not installed, it simply returns
+#an empty list so that the whole program does not crash
+#Next, it converts the page number list into the string format required by Camelot,
+#such as "1,2,3"
+#If prefer == "both", it will try two extraction modes in sequence:
+#1) stream: relies more on text layout
+#2) lattice: relies more on table borders and ruling lines
+#For each mode, it calls `camelot.read_pdf(**kwargs)` to extract tables
+#After extraction, each table goes through the following steps:
+#1) Clean the table content with `clean_dataframe()`
+#2) Read metadata such as accuracy and page number from parsing_report
+#3) Discard the result if the accuracy is too low or the table content is invalid
+#4) Otherwise, convert it into an ExtractedTable object
+#The scoring logic uses accuracy / 100 to produce the confidence score
+#In summary, if Camelot can successfully read the table, this function prefers to keep
+#the better structured result along with the corresponding parsing report
 def extract_with_camelot(
     input_pdf: Path,
     pages: List[int],
@@ -217,8 +251,7 @@ def extract_with_camelot(
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
-    verbose: bool,
-) -> List[ExtractedTable]:
+    verbose: bool,) -> List[ExtractedTable]:
     try:
         import camelot
     except ImportError:
@@ -268,30 +301,34 @@ def extract_with_camelot(
                 log(f"Skipping Camelot table due to error: {exc}", verbose)
     return extracted
 
-
+#Defines two strategies for pdfplumber extraction
+#1) based on boarder to locate table
+#2) based on text allocation to infer table
 PDFPLUMBER_SETTINGS: List[Dict[str, object]] = [
     {
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
-        "intersection_tolerance": 5,
-    },
+        "intersection_tolerance": 5,},
     {
         "vertical_strategy": "text",
         "horizontal_strategy": "text",
         "min_words_vertical": 2,
-        "min_words_horizontal": 1,
-    },
+        "min_words_horizontal": 1,},
 ]
 
-
+#This is the second extraction function
+#Begins by attempting to import `pdfplumber`; if the import fails, it returns an empty list
+#Subsequently, it opens the PDF and iterates through it page by page, 
+#applying the two sets of `PDFPLUMBER_SETTINGS` mentioned above to each page
+#Each extracted raw table is first converted into a `pd.DataFrame(raw_table)`, 
+#then processed by `clean_dataframe()`, and finally filtered using `looks_like_table()`
 def extract_with_pdfplumber(
     input_pdf: Path,
     pages: List[int],
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
-    verbose: bool,
-) -> List[ExtractedTable]:
+    verbose: bool,) -> List[ExtractedTable]:
     try:
         import pdfplumber
     except ImportError:
@@ -329,7 +366,21 @@ def extract_with_pdfplumber(
                         log(f"Skipping pdfplumber table due to error: {exc}", verbose)
     return extracted
 
-
+#This is the third extraction function
+#It first imports the PDF wrapper from img2table.document. If that import fails,
+#the function prints a warning and returns an empty list
+#Then it tries to initialize TesseractOCR. If OCR setup succeeds, it creates an OCR
+#engine with the requested language and a triple thread
+#Next, it opens the PDF with `Img2TablePDF(...)`. The page numbers are shifted by -1
+#because this library uses zero based page indexing
+#The actual extraction happens in pdf.extract_tables(...). At this stage:
+#1) borderless_tables controls whether borderless tables should also be detected
+#2) min_confidence sets the minimum confidence threshold for accepted results
+#After tables are extracted, the function loops through the results, converts each
+#table object into a DataFrame, filters out poor quality outputs, computes a
+#confidence based score, and wraps valid results as ExtractedTable objects
+#In short, this function is the OCR oriented fallback: even when the PDF itself does
+#not contain readable text, it still tries to recover table structure from the page image
 def extract_with_img2table(
     input_pdf: Path,
     pages: List[int],
@@ -338,8 +389,7 @@ def extract_with_img2table(
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
-    verbose: bool,
-) -> List[ExtractedTable]:
+    verbose: bool,) -> List[ExtractedTable]:
     try:
         from img2table.document import PDF as Img2TablePDF
     except ImportError:
@@ -350,7 +400,7 @@ def extract_with_img2table(
     try:
         from img2table.ocr import TesseractOCR
 
-        ocr = TesseractOCR(n_threads=1, lang=ocr_lang)
+        ocr = TesseractOCR(n_threads=3, lang=ocr_lang)
     except Exception as exc:
         log(f"Tesseract OCR is unavailable: {exc}", verbose)
 
@@ -392,7 +442,13 @@ def extract_with_img2table(
                 log(f"Skipping img2table table due to error: {exc}", verbose)
     return extracted
 
-
+#Exports all extracted tables into a single Excel file
+#It first makes sure the output folder exists, then opens an Excel writer and saves
+#each table to its own worksheet, using names like Table_001, Table_002, and so on.
+#It also builds a small summary table that records useful
+#metadata for each result, such as page number, table index, score, shape, and title.
+#After all sheets are created, the function uses openpyxl to do some light formatting,
+#including adjusting column widths and freezing the top row so the file is easier to read.
 def write_excel(output_path: Path, tables: Sequence[ExtractedTable]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
