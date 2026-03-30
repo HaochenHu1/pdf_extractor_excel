@@ -88,9 +88,20 @@ def parse_args() -> argparse.Namespace:
         help="Tesseract OCR language for img2table fallback",
     )
     parser.add_argument(
+        "--ocr-lang-auto",
+        action="store_true",
+        help="Auto-tune OCR language/settings for Chinese scanned PDFs when possible",
+    )
+    parser.add_argument(
         "--borderless",
         action="store_true",
         help="Enable borderless table extraction for img2table",
+    )
+    parser.add_argument(
+        "--img2table-min-confidence",
+        type=int,
+        default=50,
+        help="img2table minimum OCR confidence (0-99); lower can help noisy scanned Chinese docs",
     )
     parser.add_argument(
         "--verbose",
@@ -386,6 +397,9 @@ def extract_with_img2table(
     pages: List[int],
     ocr_lang: str,
     borderless: bool,
+    min_confidence: int,
+    implicit_rows: bool,
+    implicit_columns: bool,
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
@@ -405,13 +419,19 @@ def extract_with_img2table(
         log(f"Tesseract OCR is unavailable: {exc}", verbose)
 
     try:
-        pdf = Img2TablePDF(src=str(input_pdf), pages=[p - 1 for p in pages], pdf_text_extraction=True)
+        # For scanned PDFs, relying only on embedded PDF text can miss tables completely.
+        # If OCR is available, force image-based extraction to improve recall.
+        pdf = Img2TablePDF(
+            src=str(input_pdf),
+            pages=[p - 1 for p in pages],
+            pdf_text_extraction=ocr is None,
+        )
         tables_by_page = pdf.extract_tables(
             ocr=ocr,
-            implicit_rows=False,
-            implicit_columns=False,
+            implicit_rows=implicit_rows,
+            implicit_columns=implicit_columns,
             borderless_tables=borderless,
-            min_confidence=50,
+            min_confidence=min_confidence,
         )
     except Exception as exc:
         log(f"img2table failed: {exc}", verbose)
@@ -441,6 +461,30 @@ def extract_with_img2table(
             except Exception as exc:
                 log(f"Skipping img2table table due to error: {exc}", verbose)
     return extracted
+
+
+def tune_ocr_options(ocr_lang: str, borderless: bool, min_confidence: int, auto_tune: bool) -> Tuple[str, bool, int, bool, bool]:
+    tuned_lang = ocr_lang
+    tuned_borderless = borderless
+    tuned_confidence = max(0, min(99, int(min_confidence)))
+    implicit_rows = False
+    implicit_columns = False
+
+    if not auto_tune:
+        return tuned_lang, tuned_borderless, tuned_confidence, implicit_rows, implicit_columns
+
+    lang_lower = tuned_lang.lower()
+    has_chinese = "chi" in lang_lower or "zh" in lang_lower
+    if has_chinese:
+        # Chinese scanned tables often need borderless + implicit structure inference.
+        tuned_borderless = True
+        tuned_confidence = min(tuned_confidence, 35)
+        implicit_rows = True
+        implicit_columns = True
+        if "+" not in tuned_lang and "eng" not in lang_lower:
+            tuned_lang = f"{tuned_lang}+eng"
+
+    return tuned_lang, tuned_borderless, tuned_confidence, implicit_rows, implicit_columns
 
 #Exports all extracted tables into a single Excel file
 #It first makes sure the output folder exists, then opens an Excel writer and saves
@@ -508,6 +552,22 @@ def main() -> int:
 
     pdf_kind = detect_pdf_kind(input_pdf)
     log(f"Detected PDF type: {pdf_kind}", args.verbose)
+    tuned_ocr_lang, tuned_borderless, tuned_confidence, tuned_implicit_rows, tuned_implicit_columns = tune_ocr_options(
+        args.ocr_lang,
+        args.borderless,
+        args.img2table_min_confidence,
+        args.ocr_lang_auto,
+    )
+    if args.ocr_lang_auto:
+        log(
+            (
+                "Auto OCR tuning enabled: "
+                f"lang={tuned_ocr_lang}, borderless={tuned_borderless}, "
+                f"min_confidence={tuned_confidence}, implicit_rows={tuned_implicit_rows}, "
+                f"implicit_columns={tuned_implicit_columns}"
+            ),
+            args.verbose,
+        )
 
     extracted: List[ExtractedTable] = []
 
@@ -540,8 +600,11 @@ def main() -> int:
             extract_with_img2table(
                 input_pdf,
                 pages,
-                args.ocr_lang,
-                args.borderless,
+                tuned_ocr_lang,
+                tuned_borderless,
+                tuned_confidence,
+                tuned_implicit_rows,
+                tuned_implicit_columns,
                 args.min_rows,
                 args.min_cols,
                 args.min_filled_ratio,
@@ -572,13 +635,33 @@ def main() -> int:
                     args.verbose,
                 )
             )
+            if not extracted:
+                log("No text-based tables found; trying OCR fallback (img2table).", args.verbose)
+                extracted.extend(
+                    extract_with_img2table(
+                        input_pdf,
+                        pages,
+                        tuned_ocr_lang,
+                        tuned_borderless,
+                        tuned_confidence,
+                        tuned_implicit_rows,
+                        tuned_implicit_columns,
+                        args.min_rows,
+                        args.min_cols,
+                        args.min_filled_ratio,
+                        args.verbose,
+                    )
+                )
         else:
             extracted.extend(
                 extract_with_img2table(
                     input_pdf,
                     pages,
-                    args.ocr_lang,
-                    args.borderless,
+                    tuned_ocr_lang,
+                    tuned_borderless,
+                    tuned_confidence,
+                    tuned_implicit_rows,
+                    tuned_implicit_columns,
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
