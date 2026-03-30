@@ -119,6 +119,20 @@ The Excel workbook contains:
 python pdf_table_extractor.py financial_report.pdf -o financial_tables.xlsx --ocr-lang "chi_sim+eng"
 ```
 
+###Chinese scanned PDF tuning
+
+For scanned Chinese tables, enable OCR auto tuning:
+
+```
+python pdf_table_extractor.py input.pdf --mode img2table --ocr-lang chi_sim --ocr-lang-auto --verbose
+```
+
+You can also manually lower OCR confidence when scans are noisy:
+
+```
+python pdf_table_extractor.py input.pdf --mode img2table --ocr-lang "chi_sim+eng" --img2table-min-confidence 30 --borderless
+```
+
 ##Issues need to be fixed
 
 Chinese scanned pdfs do not have an accurate output
