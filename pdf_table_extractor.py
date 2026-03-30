@@ -683,7 +683,10 @@ def main() -> int:
 
     if not extracted:
         print(
-            "No tables were extracted. If the PDF is scanned, install img2table and Tesseract OCR, then retry with --mode img2table.",
+            (
+                "No tables were extracted. If the PDF is scanned, install img2table and OCR support, "
+                "then retry with --mode img2table --ocr-lang-auto --verbose."
+            ),
             file=sys.stderr,
         )
         return 2
