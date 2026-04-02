@@ -14,6 +14,23 @@ import fitz
 import numpy as np
 
 
+def normalize_ocr_text(text: str) -> str:
+    t = text or ""
+    t = t.replace("\u3000", " ")
+    t = t.replace("：", ":").replace("，", ",").replace("。", ".")
+    t = re.sub(r"(?<=\d)\s*[\.]\s*(?=\d)", ".", t)
+    t = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", t)
+    t = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=\d)", "", t)
+    t = re.sub(r"(?<=\d)\s+(?=[\u4e00-\u9fff])", "", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
+def merge_region_text(*regions: str) -> str:
+    return "\n".join([normalize_ocr_text(r) for r in regions if r])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Region-first extraction for scanned Chinese electricity bill PDFs")
     parser.add_argument("input_pdf", type=Path, help="Input PDF path")
@@ -177,35 +194,91 @@ def extract_date(text: str, pattern: str) -> str | None:
 
 
 def reconstruct(ocr_by_region: Dict[str, str]) -> Dict[str, Any]:
-    top = ocr_by_region.get("top_summary_region", "")
-    totals = ocr_by_region.get("totals_region", "")
-    meta = ocr_by_region.get("bottom_metadata_region", "")
+    left = normalize_ocr_text(ocr_by_region.get("left_main_region", ""))
+    top = normalize_ocr_text(ocr_by_region.get("top_summary_region", ""))
+    totals = normalize_ocr_text(ocr_by_region.get("totals_region", ""))
+    meta = normalize_ocr_text(ocr_by_region.get("bottom_metadata_region", ""))
+
+    primary = merge_region_text(left, top, totals, meta)
+
+    period_match = re.search(
+        r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})\D{0,8}(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})",
+        primary,
+    )
+    period = None
+    if period_match:
+        y1, m1, d1, y2, m2, d2 = period_match.groups()
+        period = f"{y1}-{int(m1):02d}-{int(d1):02d} 至 {y2}-{int(m2):02d}-{int(d2):02d}"
+
+    usage_rows: List[Dict[str, Any]] = []
+    usage_candidates = re.findall(r"(\d{4,6})\s+(\d{4,6})\s+([12])\s+(\d{2,4})", primary)
+    seen_usage: set[Tuple[str, str, str, str]] = set()
+    for idx, row in enumerate(usage_candidates[:2]):
+        if row in seen_usage:
+            continue
+        seen_usage.add(row)
+        prev, curr, ratio, kwh = row
+        item = "正向有功（平）" if idx == 0 else "正向有功（谷）"
+        usage_rows.append(
+            {
+                "项目": item,
+                "上期示数": float(prev),
+                "本期示数": float(curr),
+                "倍率": float(ratio),
+                "计数电量": float(kwh),
+            }
+        )
+
+    charge_rows: List[Dict[str, Any]] = []
+    charge_candidates = re.findall(r"(\d{2,4})\s+(0\.\d{3,4})\s+(\d+\.\d{2})", primary)
+    seen_charge: set[Tuple[str, str, str]] = set()
+    for idx, row in enumerate(charge_candidates[:2]):
+        if row in seen_charge:
+            continue
+        seen_charge.add(row)
+        qty, rate, amount = row
+        suffix = "平" if idx == 0 else "谷"
+        charge_rows.append(
+            {
+                "项目": f"一般非工业（非经营性质），单一制不分时，电压220V（{suffix}）电度电费",
+                "计费电量": float(qty),
+                "计费标准": float(rate),
+                "电费": float(amount),
+            }
+        )
+
+    cost_rows: List[Dict[str, Any]] = []
+    for label in ["代理购电电费", "上网环节线损费用", "输配电费", "系统运行费", "政府性基金及附加"]:
+        m = re.search(rf"{re.escape(label)}[^0-9]{{0,8}}([0-9]+(?:\.[0-9]+)?)", primary)
+        if m:
+            cost_rows.append({"子项": label, "金额": float(m.group(1))})
 
     reconstructed: Dict[str, Any] = {
         "document_type": "electricity_bill_cn",
         "page_count": 1,
         "top_summary": {
-            "本期电量": {"value": extract_number(top, r"本期电量[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"), "unit": "千瓦时"},
-            "本期电费": {"value": extract_number(top, r"本期电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"), "unit": "元"},
-            "账单打印日期": extract_date(top, r"账单打印日期[^0-9]*(20\\d{2})[-/年](\\d{2})[-/月](\\d{2})"),
-            "交费截止日期": extract_date(top, r"交费截止日期[^0-9]*(20\\d{2})[-/年](\\d{2})[-/月](\\d{2})"),
+            "本期电量": {"value": extract_number(primary, r"本期电量[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)"), "unit": "千瓦时"},
+            "本期电费": {"value": extract_number(primary, r"本期电费[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)"), "unit": "元"},
+            "账单打印日期": extract_date(primary, r"账单打印日期[^0-9]*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})"),
+            "交费截止日期": extract_date(primary, r"交费截止日期[^0-9]*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})"),
         },
         "tables": {
-            "本期用电明细": {"rows": []},
-            "本期电费明细": {"rows": []},
-            "费用构成": {"rows": []},
+            "本期用电明细": {"rows": usage_rows},
+            "本期电费明细": {"rows": charge_rows},
+            "费用构成": {"rows": cost_rows},
         },
         "summary_totals": {
-            "小计": extract_number(totals, r"小计[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
-            "本月应付电费": extract_number(totals, r"本月应付电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
-            "本月实付电费": extract_number(totals, r"本月实付电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
+            "小计": extract_number(primary, r"小计[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)"),
+            "本月应付电费": extract_number(primary, r"本月应付电费[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)"),
+            "本月实付电费": extract_number(primary, r"本月实付电费[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)"),
         },
         "bottom_metadata": {
-            "户号": re.search(r"户号\s*([0-9]{8,})", meta).group(1) if re.search(r"户号\s*([0-9]{8,})", meta) else None,
-            "用电类别": "非工业" if "非工业" in meta else None,
-            "电压等级": "交流220V" if ("交流220V" in meta or "220V" in meta) else None,
-            "供电服务单位": "浦东供电公司" if "浦东供电公司" in meta else None,
-            "供账中心": "东方枢纽" if "东方枢纽" in meta else None,
+            "账单周期": period,
+            "户号": re.search(r"户号\s*([0-9]{8,})", primary).group(1) if re.search(r"户号\s*([0-9]{8,})", primary) else None,
+            "用电类别": "非工业" if "非工业" in primary else None,
+            "电压等级": "交流220V" if ("交流220V" in primary or "220V" in primary) else None,
+            "供电服务单位": "浦东供电公司" if "浦东供电公司" in primary else None,
+            "供账中心": "东方枢纽" if "东方枢纽" in primary else None,
         },
     }
     return reconstructed
