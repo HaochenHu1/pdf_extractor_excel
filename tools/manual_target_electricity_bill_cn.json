@@ -1,0 +1,142 @@
+{
+  "document_type": "electricity_bill_cn",
+  "page_count": 1,
+  "target_extraction_scope": {
+    "include": [
+      "top summary fields",
+      "本期用电明细",
+      "本期电费明细",
+      "费用构成",
+      "summary totals"
+    ],
+    "exclude": [
+      "right-side 用能分析 chart",
+      "QR codes",
+      "barcode",
+      "long notes paragraph unless captured as raw text only"
+    ]
+  },
+  "top_summary": {
+    "本期电量": {
+      "value": 516,
+      "unit": "千瓦时"
+    },
+    "本期电费": {
+      "value": 407.17,
+      "unit": "元"
+    },
+    "账单打印日期": "2025-03-02",
+    "交费截止日期": "2025-03-18"
+  },
+  "tables": {
+    "本期用电明细": {
+      "unit": "千瓦时",
+      "columns": [
+        "项目",
+        "上期示数",
+        "本期示数",
+        "倍率",
+        "计数电量"
+      ],
+      "rows": [
+        {
+          "项目": "正向有功（平）",
+          "上期示数": 11110,
+          "本期示数": 11304,
+          "倍率": 1,
+          "计数电量": 194
+        },
+        {
+          "项目": "正向有功（谷）",
+          "上期示数": 18793,
+          "本期示数": 19115,
+          "倍率": 1,
+          "计数电量": 322
+        }
+      ]
+    },
+    "本期电费明细": {
+      "unit": {
+        "电量": "千瓦时",
+        "金额": "元"
+      },
+      "columns": [
+        "项目",
+        "计费电量",
+        "计费标准",
+        "电费"
+      ],
+      "rows": [
+        {
+          "项目": "一般非工业（非经营性质），单一制不分时，电压220V（平）电度电费",
+          "计费电量": 194,
+          "计费标准": 0.7891,
+          "电费": 153.07
+        },
+        {
+          "项目": "一般非工业（非经营性质），单一制不分时，电压220V（谷）电度电费",
+          "计费电量": 322,
+          "计费标准": 0.7891,
+          "电费": 254.10
+        }
+      ]
+    },
+    "费用构成": {
+      "columns": [
+        "子项",
+        "金额"
+      ],
+      "rows": [
+        {
+          "子项": "代理购电电费",
+          "金额": 230.50
+        },
+        {
+          "子项": "上网环节线损费用",
+          "金额": 6.55
+        },
+        {
+          "子项": "输配电费",
+          "金额": 142.20
+        },
+        {
+          "子项": "系统运行费",
+          "金额": 12.89
+        },
+        {
+          "子项": "政府性基金及附加",
+          "金额": 15.03
+        }
+      ]
+    }
+  },
+  "summary_totals": {
+    "小计": 407.17,
+    "本月应付电费": 407.17,
+    "本月实付电费": 407.17
+  },
+  "bottom_metadata": {
+    "账单周期": "2025-02-01 至 2025-02-28",
+    "户号": "3101385312362",
+    "户名": "unclear",
+    "用电地址": "unclear",
+    "用电类别": "非工业",
+    "电压等级": "交流220V",
+    "供电服务单位": "浦东供电公司",
+    "供账中心": "东方枢纽"
+  },
+  "raw_text_regions_expected": [
+    "top_summary_region",
+    "usage_detail_region",
+    "charge_detail_region",
+    "cost_breakdown_region",
+    "totals_region"
+  ],
+  "notes_for_reconstruction": [
+    "Do not treat the right-side chart as a table.",
+    "The main extraction target is the left billing panel.",
+    "Blue stamp overlap exists in the upper-right area and should not break table reconstruction.",
+    "Weak lines are present, so row and column structure may need to be reconstructed from OCR text and anchor labels.",
+    "费用构成 should be represented as sub-items under 本期电费明细 or as a separate table, but amounts must be preserved exactly."
+  ]
+}

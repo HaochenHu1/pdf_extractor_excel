@@ -33,19 +33,26 @@
 pip install -r requirements.txt
 ```
 
-### 2) Optional OCR dependencies (for scanned PDFs)
+### 2) OCR dependencies (for scanned PDFs)
 
-Install `img2table` with your preferred OCR backend:
+`requirements.txt` includes Python OCR packages (`img2table`, `paddleocr`).
+
+You must still install system OCR dependencies for Tesseract path:
 
 ```bash
-# Tesseract-based OCR
-pip install "img2table>=1.4"
-
-# or Paddle-based OCR (often better for Chinese scans)
-pip install "img2table[paddle]>=1.4"
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim
 ```
 
-If using Tesseract OCR, install the native Tesseract binary separately (platform-specific).
+```bash
+# macOS
+brew install tesseract tesseract-lang
+```
+
+Detailed setup instructions for both supported local OCR paths are in:
+
+- `docs/local_ocr_setup.md`
 
 ---
 
@@ -134,6 +141,8 @@ Generated workbook contains:
 ## Troubleshooting
 
 - If no tables are extracted from scanned PDFs:
+  - verify OCR dependencies with:
+    - `python tools/check_ocr_env.py`
   - ensure OCR dependencies are installed
   - retry with `--mode img2table --ocr-lang-auto --verbose`
 - If output is fragmented:
