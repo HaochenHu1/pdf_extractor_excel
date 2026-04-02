@@ -68,13 +68,21 @@ def parse_charge_amount(raw: str, qty: float, rate: float) -> float | None:
         return None
 
 
-def extract_labeled_number(text: str, labels: List[str]) -> float | None:
+def extract_labeled_number(text: str, labels: List[str], prefer_money: bool = False) -> float | None:
     for label in labels:
-        m = re.search(rf"{label}[^0-9]{{0,10}}([0-9]+(?:\.[0-9]+)?)", text)
-        if m:
-            val = parse_amount(m.group(1))
-            if val is not None:
-                return val
+        for m in re.finditer(label, text):
+            window = text[m.end() : m.end() + 40]
+            candidates = re.findall(r"[0-9]+(?:\.[0-9]+)?", window)
+            parsed = [parse_amount(x) for x in candidates]
+            values = [v for v in parsed if v is not None]
+            if not values:
+                continue
+            if prefer_money:
+                precise = [v for v, raw in zip(values, candidates) if "." in raw]
+                if precise:
+                    return max(precise)
+                return max(values)
+            return values[0]
     return None
 
 
@@ -339,22 +347,22 @@ def reconstruct(ocr_by_region: Dict[str, str]) -> Dict[str, Any]:
         if m:
             cost_rows.append({"子项": label, "金额": float(m.group(1))})
 
-    billed_kwh = extract_labeled_number(primary, [r"本期电量", r"计数电量", r"计费电量"])
+    billed_kwh = extract_labeled_number(primary, [r"本期电量", r"计数电量", r"计费电量"], prefer_money=False)
     if billed_kwh is None and charge_rows:
         billed_kwh = sum(row["计费电量"] for row in charge_rows)
     if billed_kwh is None and usage_rows:
         billed_kwh = sum(row["计数电量"] for row in usage_rows)
 
-    billed_fee = extract_labeled_number(primary, [r"本期电费", r"本月应付电费", r"本月实付电费", r"小计"])
+    billed_fee = extract_labeled_number(primary, [r"本期电费", r"本月应付电费", r"本月实付电费", r"小计"], prefer_money=True)
     charge_sum = round(sum(row["电费"] for row in charge_rows), 2) if charge_rows else None
     if billed_fee is None and charge_sum is not None:
         billed_fee = charge_sum
     elif billed_fee is not None and charge_sum is not None and abs(charge_sum - billed_fee) <= 1.0:
         billed_fee = charge_sum
 
-    subtotal = extract_labeled_number(primary, [r"小计"])
-    month_due = extract_labeled_number(primary, [r"本月应付电费"])
-    month_paid = extract_labeled_number(primary, [r"本月实付电费"])
+    subtotal = extract_labeled_number(primary, [r"小计"], prefer_money=True)
+    month_due = extract_labeled_number(primary, [r"本月应付电费"], prefer_money=True)
+    month_paid = extract_labeled_number(primary, [r"本月实付电费"], prefer_money=True)
 
     if subtotal is None and billed_fee is not None:
         subtotal = billed_fee
