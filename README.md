@@ -1,4 +1,4 @@
-# PDF Table Extractor (PDF → Excel)
+# PDF Table Extractor (PDF tables to Excel)
 
 `pdf_table_extractor.py` is a command-line utility that extracts tables from PDF documents and writes them to an Excel workbook (one sheet per table, plus a summary sheet).
 
