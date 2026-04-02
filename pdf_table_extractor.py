@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import fitz  #PyMuPDF
+import numpy as np
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 @dataclass
 class ExtractedTable:
@@ -48,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["auto", "camelot", "pdfplumber", "img2table"],
+        choices=["auto", "camelot", "pdfplumber", "img2table", "scanned_cn_local"],
         default="auto",
         help="Extraction backend selection",
     )
@@ -88,9 +95,26 @@ def parse_args() -> argparse.Namespace:
         help="Tesseract OCR language for img2table fallback",
     )
     parser.add_argument(
+        "--ocr-lang-auto",
+        action="store_true",
+        help="Auto-tune OCR language/settings for Chinese scanned PDFs when possible",
+    )
+    parser.add_argument(
         "--borderless",
         action="store_true",
         help="Enable borderless table extraction for img2table",
+    )
+    parser.add_argument(
+        "--img2table-min-confidence",
+        type=int,
+        default=50,
+        help="img2table minimum OCR confidence (0-99); lower can help noisy scanned Chinese docs",
+    )
+    parser.add_argument(
+        "--scan-dpi",
+        type=int,
+        default=300,
+        help="Rendering DPI used for scanned PDF local image preprocessing pipeline",
     )
     parser.add_argument(
         "--verbose",
@@ -224,6 +248,102 @@ def detect_pdf_kind(input_pdf: Path, sample_pages: int = 3) -> str:
     if total_chars >= 40:
         return "text"
     return "scanned"
+
+
+def render_pdf_page(input_pdf: Path, page_num: int, dpi: int) -> np.ndarray:
+    doc = fitz.open(str(input_pdf))
+    page = doc[page_num - 1]
+    zoom = max(1.0, dpi / 72.0)
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    doc.close()
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    else:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return img
+
+
+def estimate_skew_angle(binary_img: np.ndarray) -> float:
+    coords = np.column_stack(np.where(binary_img < 128))
+    if coords.size == 0:
+        return 0.0
+    rect = cv2.minAreaRect(coords.astype(np.float32))
+    angle = rect[-1]
+    if angle < -45:
+        angle = 90 + angle
+    if angle > 45:
+        angle = angle - 90
+    return float(angle)
+
+
+def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
+    if abs(angle) < 0.1:
+        return image
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def preprocess_scanned_page(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, h=9, templateWindowSize=7, searchWindowSize=21)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrasted = clahe.apply(denoised)
+    binary = cv2.adaptiveThreshold(
+        contrasted,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35,
+        11,
+    )
+    angle = estimate_skew_angle(binary)
+    deskewed = rotate_image(binary, angle)
+    return deskewed
+
+
+def detect_table_regions(binary_img: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    height, width = binary_img.shape[:2]
+    inv = 255 - binary_img
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(8, height // 80)))
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, width // 80), 1))
+    vertical = cv2.morphologyEx(inv, cv2.MORPH_OPEN, vertical_kernel)
+    horizontal = cv2.morphologyEx(inv, cv2.MORPH_OPEN, horizontal_kernel)
+    mask = cv2.add(vertical, horizontal)
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    mask = cv2.dilate(mask, dilate_kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    regions: List[Tuple[int, int, int, int]] = []
+    min_area = (height * width) * 0.01
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        if area < min_area:
+            continue
+        if w < width * 0.2 or h < height * 0.1:
+            continue
+        pad_x = int(w * 0.02)
+        pad_y = int(h * 0.02)
+        x0 = max(0, x - pad_x)
+        y0 = max(0, y - pad_y)
+        x1 = min(width, x + w + pad_x)
+        y1 = min(height, y + h + pad_y)
+        regions.append((x0, y0, x1, y1))
+
+    if not regions:
+        regions = [(0, 0, width, height)]
+    regions.sort(key=lambda b: (b[1], b[0]))
+    return regions
 
 #`extract_with_camelot(...)` is the first function that actually performs table extraction
 #Its purpose is to handle text based PDFs
@@ -386,6 +506,9 @@ def extract_with_img2table(
     pages: List[int],
     ocr_lang: str,
     borderless: bool,
+    min_confidence: int,
+    implicit_rows: bool,
+    implicit_columns: bool,
     min_rows: int,
     min_cols: int,
     min_filled_ratio: float,
@@ -405,13 +528,19 @@ def extract_with_img2table(
         log(f"Tesseract OCR is unavailable: {exc}", verbose)
 
     try:
-        pdf = Img2TablePDF(src=str(input_pdf), pages=[p - 1 for p in pages], pdf_text_extraction=True)
+        # For scanned PDFs, relying only on embedded PDF text can miss tables completely.
+        # If OCR is available, force image-based extraction to improve recall.
+        pdf = Img2TablePDF(
+            src=str(input_pdf),
+            pages=[p - 1 for p in pages],
+            pdf_text_extraction=ocr is None,
+        )
         tables_by_page = pdf.extract_tables(
             ocr=ocr,
-            implicit_rows=False,
-            implicit_columns=False,
+            implicit_rows=implicit_rows,
+            implicit_columns=implicit_columns,
             borderless_tables=borderless,
-            min_confidence=50,
+            min_confidence=min_confidence,
         )
     except Exception as exc:
         log(f"img2table failed: {exc}", verbose)
@@ -441,6 +570,135 @@ def extract_with_img2table(
             except Exception as exc:
                 log(f"Skipping img2table table due to error: {exc}", verbose)
     return extracted
+
+
+def extract_with_scanned_cn_local_pipeline(
+    input_pdf: Path,
+    pages: List[int],
+    ocr_lang: str,
+    min_confidence: int,
+    min_rows: int,
+    min_cols: int,
+    min_filled_ratio: float,
+    scan_dpi: int,
+    verbose: bool,
+) -> List[ExtractedTable]:
+    if cv2 is None:
+        log("opencv-python is not installed. Falling back to standard img2table pipeline.", verbose)
+        return extract_with_img2table(
+            input_pdf=input_pdf,
+            pages=pages,
+            ocr_lang=ocr_lang,
+            borderless=True,
+            min_confidence=min_confidence,
+            implicit_rows=True,
+            implicit_columns=True,
+            min_rows=min_rows,
+            min_cols=min_cols,
+            min_filled_ratio=min_filled_ratio,
+            verbose=verbose,
+        )
+
+    try:
+        from img2table.document import Image as Img2TableImage
+    except ImportError:
+        log("img2table is not installed. Skipping scanned_cn_local pipeline.", verbose)
+        return []
+
+    # Prefer PaddleOCR for Chinese if available, then fallback to Tesseract.
+    ocr = None
+    try:
+        from img2table.ocr import PaddleOCR
+
+        ocr = PaddleOCR(lang="ch")
+        log("[scanned_cn_local] Using PaddleOCR with lang=ch", verbose)
+    except Exception as exc:
+        log(f"[scanned_cn_local] PaddleOCR unavailable: {exc}", verbose)
+    if ocr is None:
+        try:
+            from img2table.ocr import TesseractOCR
+
+            ocr = TesseractOCR(n_threads=3, lang=ocr_lang)
+            log(f"[scanned_cn_local] Using TesseractOCR with lang={ocr_lang}", verbose)
+        except Exception as exc:
+            log(f"[scanned_cn_local] Tesseract OCR unavailable: {exc}", verbose)
+
+    extracted: List[ExtractedTable] = []
+    with tempfile.TemporaryDirectory(prefix="cn_scan_preproc_") as tmp_dir:
+        for page_num in pages:
+            try:
+                page_img = render_pdf_page(input_pdf, page_num=page_num, dpi=scan_dpi)
+                preprocessed = preprocess_scanned_page(page_img)
+                regions = detect_table_regions(preprocessed)
+            except Exception as exc:
+                log(f"[scanned_cn_local] Preprocessing failed on page {page_num}: {exc}", verbose)
+                continue
+
+            for region_idx, (x0, y0, x1, y1) in enumerate(regions, start=1):
+                try:
+                    crop = preprocessed[y0:y1, x0:x1]
+                    if crop.size == 0:
+                        continue
+                    crop_path = Path(tmp_dir) / f"p{page_num:04d}_r{region_idx:03d}.png"
+                    cv2.imwrite(str(crop_path), crop)
+
+                    img_doc = Img2TableImage(src=str(crop_path))
+                    tables = img_doc.extract_tables(
+                        ocr=ocr,
+                        borderless_tables=False,
+                        implicit_rows=True,
+                        implicit_columns=True,
+                        min_confidence=min_confidence,
+                    )
+                    for idx, table in enumerate(tables):
+                        raw_df = getattr(table, "df", None)
+                        if raw_df is None:
+                            continue
+                        df = clean_dataframe(pd.DataFrame(raw_df))
+                        if not looks_like_table(df, min_rows, min_cols, min_filled_ratio):
+                            continue
+                        score = dataframe_filled_ratio(df)
+                        extracted.append(
+                            ExtractedTable(
+                                df=df,
+                                page=page_num,
+                                engine="scanned_cn_local",
+                                score=score,
+                                title=f"local_cn page {page_num} region {region_idx} table {idx + 1}",
+                            )
+                        )
+                except Exception as exc:
+                    log(
+                        f"[scanned_cn_local] OCR/table parse failed on page {page_num}, region {region_idx}: {exc}",
+                        verbose,
+                    )
+                    continue
+
+    return deduplicate_tables(extracted)
+
+
+def tune_ocr_options(ocr_lang: str, borderless: bool, min_confidence: int, auto_tune: bool) -> Tuple[str, bool, int, bool, bool]:
+    tuned_lang = ocr_lang
+    tuned_borderless = borderless
+    tuned_confidence = max(0, min(99, int(min_confidence)))
+    implicit_rows = False
+    implicit_columns = False
+
+    if not auto_tune:
+        return tuned_lang, tuned_borderless, tuned_confidence, implicit_rows, implicit_columns
+
+    lang_lower = tuned_lang.lower()
+    has_chinese = "chi" in lang_lower or "zh" in lang_lower
+    if has_chinese:
+        # Chinese scanned tables often need borderless + implicit structure inference.
+        tuned_borderless = True
+        tuned_confidence = min(tuned_confidence, 35)
+        implicit_rows = True
+        implicit_columns = True
+        if "+" not in tuned_lang and "eng" not in lang_lower:
+            tuned_lang = f"{tuned_lang}+eng"
+
+    return tuned_lang, tuned_borderless, tuned_confidence, implicit_rows, implicit_columns
 
 #Exports all extracted tables into a single Excel file
 #It first makes sure the output folder exists, then opens an Excel writer and saves
@@ -508,6 +766,22 @@ def main() -> int:
 
     pdf_kind = detect_pdf_kind(input_pdf)
     log(f"Detected PDF type: {pdf_kind}", args.verbose)
+    tuned_ocr_lang, tuned_borderless, tuned_confidence, tuned_implicit_rows, tuned_implicit_columns = tune_ocr_options(
+        args.ocr_lang,
+        args.borderless,
+        args.img2table_min_confidence,
+        args.ocr_lang_auto,
+    )
+    if args.ocr_lang_auto:
+        log(
+            (
+                "Auto OCR tuning enabled: "
+                f"lang={tuned_ocr_lang}, borderless={tuned_borderless}, "
+                f"min_confidence={tuned_confidence}, implicit_rows={tuned_implicit_rows}, "
+                f"implicit_columns={tuned_implicit_columns}"
+            ),
+            args.verbose,
+        )
 
     extracted: List[ExtractedTable] = []
 
@@ -540,12 +814,29 @@ def main() -> int:
             extract_with_img2table(
                 input_pdf,
                 pages,
-                args.ocr_lang,
-                args.borderless,
+                tuned_ocr_lang,
+                tuned_borderless,
+                tuned_confidence,
+                tuned_implicit_rows,
+                tuned_implicit_columns,
                 args.min_rows,
                 args.min_cols,
                 args.min_filled_ratio,
                 args.verbose,
+            )
+        )
+    elif args.mode == "scanned_cn_local":
+        extracted.extend(
+            extract_with_scanned_cn_local_pipeline(
+                input_pdf=input_pdf,
+                pages=pages,
+                ocr_lang=tuned_ocr_lang,
+                min_confidence=tuned_confidence,
+                min_rows=args.min_rows,
+                min_cols=args.min_cols,
+                min_filled_ratio=args.min_filled_ratio,
+                scan_dpi=args.scan_dpi,
+                verbose=args.verbose,
             )
         )
     else:
@@ -572,13 +863,50 @@ def main() -> int:
                     args.verbose,
                 )
             )
+            if not extracted:
+                log("No text-based tables found; trying OCR fallback (img2table).", args.verbose)
+                extracted.extend(
+                    extract_with_img2table(
+                        input_pdf,
+                        pages,
+                        tuned_ocr_lang,
+                        tuned_borderless,
+                        tuned_confidence,
+                        tuned_implicit_rows,
+                        tuned_implicit_columns,
+                        args.min_rows,
+                        args.min_cols,
+                        args.min_filled_ratio,
+                        args.verbose,
+                    )
+                )
         else:
+            has_chinese_hint = ("chi" in tuned_ocr_lang.lower()) or ("zh" in tuned_ocr_lang.lower())
+            if has_chinese_hint:
+                extracted.extend(
+                    extract_with_scanned_cn_local_pipeline(
+                        input_pdf=input_pdf,
+                        pages=pages,
+                        ocr_lang=tuned_ocr_lang,
+                        min_confidence=tuned_confidence,
+                        min_rows=args.min_rows,
+                        min_cols=args.min_cols,
+                        min_filled_ratio=args.min_filled_ratio,
+                        scan_dpi=args.scan_dpi,
+                        verbose=args.verbose,
+                    )
+                )
+            if not extracted:
+                log("Local scanned-cn pipeline returned no tables; trying generic img2table.", args.verbose)
             extracted.extend(
                 extract_with_img2table(
                     input_pdf,
                     pages,
-                    args.ocr_lang,
-                    args.borderless,
+                    tuned_ocr_lang,
+                    tuned_borderless,
+                    tuned_confidence,
+                    tuned_implicit_rows,
+                    tuned_implicit_columns,
                     args.min_rows,
                     args.min_cols,
                     args.min_filled_ratio,
@@ -600,7 +928,10 @@ def main() -> int:
 
     if not extracted:
         print(
-            "No tables were extracted. If the PDF is scanned, install img2table and Tesseract OCR, then retry with --mode img2table.",
+            (
+                "No tables were extracted. If the PDF is scanned, install img2table and OCR support, "
+                "then retry with --mode img2table --ocr-lang-auto --verbose."
+            ),
             file=sys.stderr,
         )
         return 2

@@ -1,10 +1,16 @@
+# Core data and export stack
 pandas>=2.0
 openpyxl>=3.1
+numpy>=1.24
+opencv-python-headless>=4.8
+
+# PDF parsing
 PyMuPDF>=1.23
-camelot-py>=1.0.0
 pdfplumber>=0.11
-# Optional, mainly for scanned PDFs:
-# img2table[paddle]>=1.4
-# Or:
-# img2table>=1.4
-# tesseract must be installed separately if you use Tesseract OCR
+camelot-py>=1.0.0
+
+# Optional OCR stack for scanned PDFs (install separately as needed):
+#   pip install "img2table>=1.4"            # Tesseract-based OCR
+#   pip install "img2table[paddle]>=1.4"    # PaddleOCR-based OCR
+#
+# Note: Tesseract OCR requires native system binaries installed outside pip.
