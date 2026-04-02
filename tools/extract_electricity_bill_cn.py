@@ -14,6 +14,80 @@ import fitz
 import numpy as np
 
 
+def normalize_ocr_text(text: str) -> str:
+    t = text or ""
+    t = t.replace("\u3000", " ")
+    t = t.replace("：", ":").replace("，", ",").replace("。", ".")
+    t = re.sub(r"(?<=\d)\s*[\.]\s*(?=\d)", ".", t)
+    t = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", t)
+    t = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=\d)", "", t)
+    t = re.sub(r"(?<=\d)\s+(?=[\u4e00-\u9fff])", "", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
+def merge_region_text(*regions: str) -> str:
+    return "\n".join([normalize_ocr_text(r) for r in regions if r])
+
+
+def parse_amount(raw: str) -> float | None:
+    token = raw.strip().replace(",", "")
+    if not token:
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def parse_charge_amount(raw: str, qty: float, rate: float) -> float | None:
+    token = raw.strip().replace(",", "")
+    if not token:
+        return None
+    expected = qty * rate
+    if "." in token:
+        try:
+            val = float(token)
+            if 0 < val < 20000:
+                return val
+            return None
+        except ValueError:
+            return None
+    if token.isdigit() and len(token) >= 4:
+        repaired = float(f"{token[:-2]}.{token[-2:]}")
+        if abs(repaired - expected) <= 5.0:
+            return repaired
+        return None
+    try:
+        val = float(token)
+        if abs(val - expected) <= 5.0:
+            return val
+        return None
+    except ValueError:
+        return None
+
+
+def extract_labeled_number(text: str, labels: List[str]) -> float | None:
+    for label in labels:
+        m = re.search(rf"{label}[^0-9]{{0,10}}([0-9]+(?:\.[0-9]+)?)", text)
+        if m:
+            val = parse_amount(m.group(1))
+            if val is not None:
+                return val
+    return None
+
+
+def pick_account_number(text: str) -> str | None:
+    labeled = re.search(r"户号\s*([0-9]{8,})", text)
+    if labeled:
+        return labeled.group(1)
+    candidates = re.findall(r"(?<!\d)([0-9]{12,16})(?!\d)", text)
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Region-first extraction for scanned Chinese electricity bill PDFs")
     parser.add_argument("input_pdf", type=Path, help="Input PDF path")
@@ -177,35 +251,150 @@ def extract_date(text: str, pattern: str) -> str | None:
 
 
 def reconstruct(ocr_by_region: Dict[str, str]) -> Dict[str, Any]:
-    top = ocr_by_region.get("top_summary_region", "")
-    totals = ocr_by_region.get("totals_region", "")
-    meta = ocr_by_region.get("bottom_metadata_region", "")
+    left = normalize_ocr_text(ocr_by_region.get("left_main_region", ""))
+    top = normalize_ocr_text(ocr_by_region.get("top_summary_region", ""))
+    totals = normalize_ocr_text(ocr_by_region.get("totals_region", ""))
+    meta = normalize_ocr_text(ocr_by_region.get("bottom_metadata_region", ""))
+
+    primary = merge_region_text(left, top, totals, meta)
+
+    period = None
+    period_label = re.search(r"账单周期", primary)
+    period_window = primary[period_label.start() : period_label.start() + 80] if period_label else ""
+    period_match = re.search(
+        r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})\D{0,10}(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})",
+        period_window,
+    )
+    if period_match:
+        y1, m1, d1, y2, m2, d2 = period_match.groups()
+        period = f"{y1}-{int(m1):02d}-{int(d1):02d} 至 {y2}-{int(m2):02d}-{int(d2):02d}"
+
+    usage_rows: List[Dict[str, Any]] = []
+    usage_candidates: List[Tuple[str, str, str, str]] = []
+    for line in primary.splitlines():
+        if "." in line:
+            continue
+        nums = re.findall(r"\d+", line)
+        if len(nums) < 3:
+            continue
+        prev, curr = nums[0], nums[1]
+        if not (4 <= len(prev) <= 6 and 4 <= len(curr) <= 6):
+            continue
+        if len(nums) >= 4 and len(nums[2]) <= 2:
+            ratio, kwh = nums[2], nums[3]
+        else:
+            ratio, kwh = "1", nums[2]
+        usage_candidates.append((prev, curr, ratio, kwh))
+
+    seen_usage: set[Tuple[str, str, str, str]] = set()
+    for idx, row in enumerate(usage_candidates[:2]):
+        if row in seen_usage:
+            continue
+        seen_usage.add(row)
+        prev, curr, ratio, kwh = row
+        ratio_f = float(ratio)
+        item = "正向有功（平）" if idx == 0 else "正向有功（谷）"
+        usage_rows.append(
+            {
+                "项目": item,
+                "上期示数": float(prev),
+                "本期示数": float(curr),
+                "倍率": ratio_f,
+                "计数电量": float(kwh),
+            }
+        )
+
+    charge_rows: List[Dict[str, Any]] = []
+    charge_candidates = re.findall(r"(\d{2,4})\s+(0\.\d{3,4})\s+([0-9]+(?:\.[0-9]{1,2})?)", primary)
+    parsed_charge_rows: List[Tuple[float, float, float]] = []
+    seen_charge: set[Tuple[str, str, str]] = set()
+    for row in charge_candidates:
+        if row in seen_charge:
+            continue
+        seen_charge.add(row)
+        qty, rate, amount = row
+        qty_f, rate_f = float(qty), float(rate)
+        parsed_amount = parse_charge_amount(amount, qty_f, rate_f)
+        if parsed_amount is None:
+            continue
+        if not (10 <= qty_f <= 2000 and 0.1 <= rate_f <= 2.0 and 1 <= parsed_amount <= 5000):
+            continue
+        parsed_charge_rows.append((qty_f, rate_f, parsed_amount))
+
+    parsed_charge_rows.sort(key=lambda x: x[0])
+    for idx, (qty_f, rate_f, parsed_amount) in enumerate(parsed_charge_rows[:2]):
+        suffix = "平" if idx == 0 else "谷"
+        charge_rows.append(
+            {
+                "项目": f"一般非工业（非经营性质），单一制不分时，电压220V（{suffix}）电度电费",
+                "计费电量": qty_f,
+                "计费标准": rate_f,
+                "电费": parsed_amount,
+            }
+        )
+
+    cost_rows: List[Dict[str, Any]] = []
+    for label in ["代理购电电费", "上网环节线损费用", "输配电费", "系统运行费", "政府性基金及附加"]:
+        m = re.search(rf"{re.escape(label)}[^0-9]{{0,8}}([0-9]+(?:\.[0-9]+)?)", primary)
+        if m:
+            cost_rows.append({"子项": label, "金额": float(m.group(1))})
+
+    billed_kwh = extract_labeled_number(primary, [r"本期电量", r"计数电量", r"计费电量"])
+    if billed_kwh is None and charge_rows:
+        billed_kwh = sum(row["计费电量"] for row in charge_rows)
+    if billed_kwh is None and usage_rows:
+        billed_kwh = sum(row["计数电量"] for row in usage_rows)
+
+    billed_fee = extract_labeled_number(primary, [r"本期电费", r"本月应付电费", r"本月实付电费", r"小计"])
+    charge_sum = round(sum(row["电费"] for row in charge_rows), 2) if charge_rows else None
+    if billed_fee is None and charge_sum is not None:
+        billed_fee = charge_sum
+    elif billed_fee is not None and charge_sum is not None and abs(charge_sum - billed_fee) <= 1.0:
+        billed_fee = charge_sum
+
+    subtotal = extract_labeled_number(primary, [r"小计"])
+    month_due = extract_labeled_number(primary, [r"本月应付电费"])
+    month_paid = extract_labeled_number(primary, [r"本月实付电费"])
+
+    if subtotal is None and billed_fee is not None:
+        subtotal = billed_fee
+    if subtotal is not None and billed_fee is not None and abs(subtotal - billed_fee) > 20:
+        subtotal = billed_fee
+    if month_due is None and billed_fee is not None:
+        month_due = billed_fee
+    if month_due is not None and month_due > 1000 and billed_fee is not None:
+        month_due = billed_fee
+    if month_paid is None and month_due is not None:
+        month_paid = month_due
+    if month_paid is not None and month_paid > 1000 and month_due is not None:
+        month_paid = month_due
 
     reconstructed: Dict[str, Any] = {
         "document_type": "electricity_bill_cn",
         "page_count": 1,
         "top_summary": {
-            "本期电量": {"value": extract_number(top, r"本期电量[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"), "unit": "千瓦时"},
-            "本期电费": {"value": extract_number(top, r"本期电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"), "unit": "元"},
-            "账单打印日期": extract_date(top, r"账单打印日期[^0-9]*(20\\d{2})[-/年](\\d{2})[-/月](\\d{2})"),
-            "交费截止日期": extract_date(top, r"交费截止日期[^0-9]*(20\\d{2})[-/年](\\d{2})[-/月](\\d{2})"),
+            "本期电量": {"value": billed_kwh, "unit": "千瓦时"},
+            "本期电费": {"value": billed_fee, "unit": "元"},
+            "账单打印日期": extract_date(primary, r"账单打印日期[^0-9]*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})"),
+            "交费截止日期": extract_date(primary, r"交费截止日期[^0-9]*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})"),
         },
         "tables": {
-            "本期用电明细": {"rows": []},
-            "本期电费明细": {"rows": []},
-            "费用构成": {"rows": []},
+            "本期用电明细": {"rows": usage_rows},
+            "本期电费明细": {"rows": charge_rows},
+            "费用构成": {"rows": cost_rows},
         },
         "summary_totals": {
-            "小计": extract_number(totals, r"小计[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
-            "本月应付电费": extract_number(totals, r"本月应付电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
-            "本月实付电费": extract_number(totals, r"本月实付电费[^0-9]{0,8}([0-9]+(?:\\.[0-9]+)?)"),
+            "小计": subtotal,
+            "本月应付电费": month_due,
+            "本月实付电费": month_paid,
         },
         "bottom_metadata": {
-            "户号": re.search(r"户号\s*([0-9]{8,})", meta).group(1) if re.search(r"户号\s*([0-9]{8,})", meta) else None,
-            "用电类别": "非工业" if "非工业" in meta else None,
-            "电压等级": "交流220V" if ("交流220V" in meta or "220V" in meta) else None,
-            "供电服务单位": "浦东供电公司" if "浦东供电公司" in meta else None,
-            "供账中心": "东方枢纽" if "东方枢纽" in meta else None,
+            "账单周期": period,
+            "户号": pick_account_number(primary),
+            "用电类别": "非工业" if "非工业" in primary else None,
+            "电压等级": "交流220V" if ("交流220V" in primary or "220V" in primary) else None,
+            "供电服务单位": "浦东供电公司" if "浦东供电公司" in primary else None,
+            "供账中心": "东方枢纽" if "东方枢纽" in primary else None,
         },
     }
     return reconstructed
